@@ -151,6 +151,8 @@ int main(int argc, const char **argv)
   log.status() << "Found " << loops.size() << " loop(s)." << messaget::eom;
 
   ui_message_handlert ui_message_handler(message_handler);
+  ui_message_handler.set_verbosity(messaget::M_STATUS);
+
 
   const namespacet ns(goto_model.symbol_table);
 
@@ -175,19 +177,24 @@ int main(int argc, const char **argv)
                    << loop_id.loop_number << ": " << candidates.size()
                    << " candidate(s)" << messaget::eom;
 
+      auto &prov = provable_invariants[loop_id];
+      auto &unprov = unprovable_invariants[loop_id];
+
       for(const auto &candidate : candidates)
       {
         // Skip already-classified candidates.
-        auto &prov = provable_invariants[loop_id];
-        auto &unprov = unprovable_invariants[loop_id];
+
         if(
           std::find(prov.begin(), prov.end(), candidate) != prov.end() ||
           std::find(unprov.begin(), unprov.end(), candidate) != unprov.end())
           continue;
 
         // 4. Check provability.
+        message_handler.set_verbosity(messaget::M_ERROR);
         const provability_resultt r = check_invariant_provable(
           goto_model, loop_id, candidate, options, ui_message_handler, log);
+        message_handler.set_verbosity(messaget::M_STATUS);
+
 
         if(r.is_provable)
         {
@@ -201,6 +208,34 @@ int main(int argc, const char **argv)
           unprov.push_back(candidate);
         }
       }
+      //x >= 0 && (x <= n || n <= 0)
+      log.status() << "\n Checking Handwritten invariants " << messaget::eom;
+      auto expr = parse_invariant_string(goto_model, loop_id, "x >= 0 && (x <= n || n <= 0)", message_handler);
+      if(expr)
+      {
+        log.status() << "  Expression " << expr2c(expr.value(), ns) << messaget::eom;
+
+        message_handler.set_verbosity(messaget::M_ERROR);
+        auto result = check_invariant_provable(goto_model, loop_id, *expr, options, ui_message_handler, log);
+        message_handler.set_verbosity(messaget::M_STATUS);
+
+        if(result.is_provable)
+        {
+          log.status() << "  PROVABLE: " << expr2c(expr.value(), ns) << messaget::eom;
+          prov.push_back(expr.value());
+        }
+        else
+        {
+          log.status() << "  not provable: " << expr2c(expr.value(), ns)
+                       << messaget::eom;
+        }
+      }
+      else
+      {
+        log.status() << "  Parse did not work " << expr2c(expr.value(), ns) << messaget::eom;
+
+      }
+
     }
 
     // 5. Print summary of provable invariants.
@@ -235,8 +270,10 @@ int main(int argc, const char **argv)
       continue;
     }
 
+    message_handler.set_verbosity(messaget::M_ERROR);
     const vc_check_resultt vc = check_vcs_with_invariants(
       goto_model, combined, options, ui_message_handler, log);
+    message_handler.set_verbosity(messaget::M_STATUS);
 
     if(vc.is_sufficient)
     {

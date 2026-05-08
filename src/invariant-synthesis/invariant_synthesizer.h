@@ -38,4 +38,13 @@ std::vector<exprt> enumerate_symbolic_comparison_from_vars(
   const loop_idt &loop_id,
   messaget &log);
 
+/// Parses \p expr_str as a C boolean expression in the variable scope of
+/// \p loop_id's function and returns the typed \c exprt.
+/// Returns \c nullopt if parsing or type-checking fails.
+std::optional<exprt> parse_invariant_string(
+  const goto_modelt &goto_model,
+  const loop_idt &loop_id,
+  const std::string &expr_str,
+  message_handlert &message_handler);
+
 #endif // CPROVER_INVARIANT_SYNTHESIS_INVARIANT_SYNTHESIZER_H
