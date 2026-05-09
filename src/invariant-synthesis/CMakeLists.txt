@@ -20,6 +20,7 @@ target_link_libraries(invariant-synthesis-lib
 )
 
 # Executable
-add_executable(invariant-synthesis invariant_synthesis_main.cpp)
+add_executable(invariant-synthesis invariant_synthesis_main.cpp
+        ollama.h)
 target_link_libraries(invariant-synthesis invariant-synthesis-lib)
 install(TARGETS invariant-synthesis DESTINATION ${CMAKE_INSTALL_BINDIR})

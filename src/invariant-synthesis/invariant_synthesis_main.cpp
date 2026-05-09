@@ -9,6 +9,9 @@ Author: CBMC Contributors
 /// \file
 /// Main entry point for the invariant-synthesis tool.
 
+#include "ollama.h"
+
+#include <fstream>
 #ifdef _MSC_VER
 #  include <util/unicode.h>
 #endif
@@ -95,8 +98,37 @@ int wmain(int argc, const wchar_t **argv_wide)
   auto narrow = to_c_str_array(std::begin(vec), std::end(vec));
   auto argv = narrow.data();
 #else
+
+vc_check_resultt check_vcs_wrapper(
+  console_message_handlert& message_handler,
+  messaget log,
+  const optionst& options,
+  const goto_modelt& goto_model,
+  const std::vector<loop_idt>& loops,
+  ui_message_handlert& ui_message_handler,
+  std::map<loop_idt, std::vector<exprt>> provable_invariants)
+{
+  std::map<loop_idt, exprt> combined;
+  for(const auto &loop_id : loops)
+  {
+    const auto &prov = provable_invariants[loop_id];
+    if(prov.empty()) {
+      continue;
+    }
+    combined[loop_id] = conjunction(prov);
+  }
+
+  message_handler.set_verbosity(messaget::M_ERROR);
+  vc_check_resultt vc = check_vcs_with_invariants(
+    goto_model, combined, options, ui_message_handler, log);
+  message_handler.set_verbosity(messaget::M_STATUS);
+  return vc;
+}
+
+
 int main(int argc, const char **argv)
 {
+
 #endif
   if(argc < 2)
   {
@@ -127,9 +159,14 @@ int main(int argc, const char **argv)
   // 1. Parse the C file.
   log.status() << "Parsing " << argv[1] << messaget::eom;
   goto_modelt goto_model;
+  std::string c_file;
   try
   {
     goto_model = initialize_goto_model({argv[1]}, message_handler, options);
+    std::ifstream t(argv[1]);
+    std::stringstream buffer;
+    buffer << t.rdbuf();
+    c_file = buffer.str();
   }
   catch(const std::exception &e)
   {
@@ -160,6 +197,43 @@ int main(int argc, const char **argv)
   std::map<loop_idt, std::vector<exprt>> provable_invariants;
   std::map<loop_idt, std::vector<exprt>> unprovable_invariants;
 
+
+  // Generate a list of fixed symbolic invariants first and filter them.
+  log.status() << "\n=== Symbolic Invariants ===" << messaget::eom;
+  for(const auto &loop_id : loops)
+  {
+    const std::vector<exprt> candidates =
+      enumerate_symbolic_comparison_from_vars(goto_model, loop_id, log);
+
+    log.status() << "Loop " << loop_id.function_id << "."
+                 << loop_id.loop_number << ": " << candidates.size()
+                 << " candidate(s)" << messaget::eom;
+
+    auto &prov = provable_invariants[loop_id];
+    auto &unprov = unprovable_invariants[loop_id];
+
+    for(const auto &candidate : candidates) {
+      // Skip already-classified candidates.
+
+      if(
+        std::find(prov.begin(), prov.end(), candidate) != prov.end() ||
+        std::find(unprov.begin(), unprov.end(), candidate) != unprov.end())
+        continue;
+
+      // 4. Check provability.
+      message_handler.set_verbosity(messaget::M_ERROR);
+      const provability_resultt r = check_invariant_provable(
+        goto_model, loop_id, candidate, options, ui_message_handler, log);
+      message_handler.set_verbosity(messaget::M_STATUS);
+
+      if(r.is_provable) {
+        prov.push_back(candidate);
+      } else {
+        unprov.push_back(candidate);
+      }
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Main synthesis loop
   // ---------------------------------------------------------------------------
@@ -180,8 +254,7 @@ int main(int argc, const char **argv)
       auto &prov = provable_invariants[loop_id];
       auto &unprov = unprovable_invariants[loop_id];
 
-      for(const auto &candidate : candidates)
-      {
+      for(const auto &candidate : candidates) {
         // Skip already-classified candidates.
 
         if(
@@ -195,45 +268,35 @@ int main(int argc, const char **argv)
           goto_model, loop_id, candidate, options, ui_message_handler, log);
         message_handler.set_verbosity(messaget::M_STATUS);
 
-
-        if(r.is_provable)
-        {
-          log.status() << "  PROVABLE: " << expr2c(candidate, ns) << messaget::eom;
+        if(r.is_provable) {
           prov.push_back(candidate);
-        }
-        else
-        {
-          log.status() << "  not provable: " << expr2c(candidate, ns)
-                       << messaget::eom;
+        } else {
           unprov.push_back(candidate);
         }
       }
+
+      ollama::response response = ollama::generate("qwen3:4b-instruct",
+        "Generate an invariant using C syntax with boolean connectives and standard arithmetic expressions and functions for the loop in the following C program:\n\n");
+      log.status() << "\n Ollama Response: " << response.as_simple_string() << messaget::eom;
+
+
       //x >= 0 && (x <= n || n <= 0)
       log.status() << "\n Checking Handwritten invariants " << messaget::eom;
-      auto expr = parse_invariant_string(goto_model, loop_id, "x >= 0 && (x <= n || n <= 0)", message_handler);
-      if(expr)
-      {
+      auto expr = parse_invariant_string(goto_model, loop_id, "!(x < 4 % 2 ) && (x <= n || n <= 0)", message_handler);
+      if(expr) {
         log.status() << "  Expression " << expr2c(expr.value(), ns) << messaget::eom;
 
         message_handler.set_verbosity(messaget::M_ERROR);
         auto result = check_invariant_provable(goto_model, loop_id, *expr, options, ui_message_handler, log);
         message_handler.set_verbosity(messaget::M_STATUS);
 
-        if(result.is_provable)
-        {
-          log.status() << "  PROVABLE: " << expr2c(expr.value(), ns) << messaget::eom;
+        if(result.is_provable) {
           prov.push_back(expr.value());
+        } else {
+          unprov.push_back(expr.value());
         }
-        else
-        {
-          log.status() << "  not provable: " << expr2c(expr.value(), ns)
-                       << messaget::eom;
-        }
-      }
-      else
-      {
-        log.status() << "  Parse did not work " << expr2c(expr.value(), ns) << messaget::eom;
-
+      } else {
+        log.status() << "could not parse: " << messaget::eom;
       }
 
     }
@@ -250,30 +313,14 @@ int main(int argc, const char **argv)
 
     // 6. Try to prove VCs using the conjunction of all provable invariants.
     // Build a single combined invariant per loop (conjunction of all provable).
-    std::map<loop_idt, exprt> combined;
-    bool any_provable = false;
-    for(const auto &loop_id : loops)
-    {
-      const auto &prov = provable_invariants[loop_id];
-      if(prov.empty())
-        continue;
-      any_provable = true;
-      exprt conj = prov[0];
-      for(std::size_t i = 1; i < prov.size(); ++i)
-        conj = and_exprt(conj, prov[i]);
-      combined[loop_id] = conj;
-    }
-
-    if(!any_provable)
-    {
-      log.status() << "No provable invariants yet, continuing." << messaget::eom;
-      continue;
-    }
-
-    message_handler.set_verbosity(messaget::M_ERROR);
-    const vc_check_resultt vc = check_vcs_with_invariants(
-      goto_model, combined, options, ui_message_handler, log);
-    message_handler.set_verbosity(messaget::M_STATUS);
+    vc_check_resultt vc = check_vcs_wrapper(
+         message_handler,
+         log,
+         options,
+         goto_model,
+         loops,
+         ui_message_handler,
+         provable_invariants);
 
     if(vc.is_sufficient)
     {
@@ -286,9 +333,7 @@ int main(int argc, const char **argv)
                        << messaget::eom;
       }
       return CPROVER_EXIT_SUCCESS;
-    }
-    else
-    {
+    } else {
       log.status() << "VCs not yet proved. Counterexample available: "
                    << (vc.counterexample.has_value() ? "yes" : "no")
                    << messaget::eom;

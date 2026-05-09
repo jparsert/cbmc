@@ -15,8 +15,11 @@ Author: CBMC Contributors
 #include <util/c_types.h>
 #include <util/message.h>
 #include <util/std_expr.h>
+#include <util/symbol_table.h>
 
 #include <goto-programs/goto_functions.h>
+
+#include <ansi-c/ansi_c_language.h>
 
 std::vector<symbol_exprt> collect_loop_variables(
   const goto_modelt &goto_model,
@@ -120,150 +123,56 @@ std::optional<exprt> parse_invariant_string(
   const std::string &expr_str,
   message_handlert &message_handler)
 {
-  // Supported syntax: "<lhs> <op> <rhs>"
-  // where op is one of: <=, >=, <, >, ==, !=
-  // and each side is either a variable name or an integer literal.
-  static const std::array<std::pair<std::string, irep_idt>, 6> ops = {{
-    {"<=", ID_le}, {">=", ID_ge}, {"!=", ID_notequal},
-    {"<",  ID_lt}, {">",  ID_gt}, {"==", ID_equal},
-  }};
+  // Build a symbol table with variables under their base names so that
+  // to_expr can resolve e.g. "x" even though the real symbol is "main::1::x".
+  // After parsing we substitute the base-name symbols back to the real ones.
+  symbol_tablet base_st;
+  std::map<irep_idt, symbol_exprt> base_to_real; // base_name -> real symbol_exprt
 
-  const auto vars = collect_loop_variables(goto_model, loop_id);
-
-  // Build a map from bare name to exprt.
-  std::map<std::string, exprt> var_map;
-  for(const auto &v : vars)
+  for(const auto &v : collect_loop_variables(goto_model, loop_id))
   {
     const std::string full = id2string(v.get_identifier());
     const auto pos = full.rfind("::");
-    var_map[pos == std::string::npos ? full : full.substr(pos + 2)] = v;
+    const irep_idt base =
+      pos == std::string::npos ? full : irep_idt(full.substr(pos + 2));
+
+    if(base_to_real.count(base))
+      continue; // skip shadowed names
+
+    symbolt sym;
+    sym.name = base;
+    sym.base_name = base;
+    sym.type = v.type();
+    sym.is_lvalue = true;
+    base_st.add(sym);
+    base_to_real.emplace(base, v);
   }
 
-  auto trim = [](const std::string &s) {
-    const auto a = s.find_first_not_of(' ');
-    const auto b = s.find_last_not_of(' ');
-    return a == std::string::npos ? std::string{} : s.substr(a, b - a + 1);
-  };
-
-  // Resolve a token to an exprt: variable or integer literal.
-  auto resolve = [&](const std::string &tok,
-                     const typet &hint) -> std::optional<exprt>
-  {
-    const std::string t = trim(tok);
-    if(t.empty())
-      return std::nullopt;
-    auto it = var_map.find(t);
-    if(it != var_map.end())
-      return it->second;
-    try
-    {
-      const long long val = std::stoll(t);
-      return from_integer(
-        val,
-        hint.id() == ID_signedbv || hint.id() == ID_unsignedbv
-          ? hint
-          : signed_int_type());
-    }
-    catch(...) { return std::nullopt; }
-  };
-
-  // Forward declaration for recursion.
-  std::function<std::optional<exprt>(const std::string &)> parse_expr;
-
-  // Parse a single comparison atom.
-  auto parse_atom = [&](const std::string &s) -> std::optional<exprt>
-  {
-    for(const auto &[op_str, op_id] : ops)
-    {
-      const auto pos = s.find(op_str);
-      if(pos == std::string::npos)
-        continue;
-      const std::string lhs_tok = s.substr(0, pos);
-      const std::string rhs_tok = s.substr(pos + op_str.size());
-      auto lhs = resolve(lhs_tok, signed_int_type());
-      auto rhs = resolve(rhs_tok, lhs ? lhs->type() : signed_int_type());
-      if(!lhs || !rhs)
-        continue;
-      lhs = resolve(lhs_tok, rhs->type());
-      if(!lhs)
-        continue;
-      exprt l = *lhs, r = *rhs;
-      if(l.type() != r.type())
-      {
-        if(r.type().id() == ID_signedbv || r.type().id() == ID_unsignedbv)
-          l = typecast_exprt(l, r.type());
-        else
-          r = typecast_exprt(r, l.type());
-      }
-      return binary_relation_exprt(l, op_id, r);
-    }
-    return std::nullopt;
-  };
-
-  // Find the last occurrence of `conn` outside any parentheses.
-  // We use the last (rightmost) occurrence so that left-associativity is
-  // preserved when the same connective appears multiple times.
-  auto find_connective = [](const std::string &s,
-                            const std::string &conn) -> std::size_t
-  {
-    int depth = 0;
-    std::size_t found = std::string::npos;
-    for(std::size_t i = 0; i + conn.size() <= s.size(); ++i)
-    {
-      if(s[i] == '(') { ++depth; continue; }
-      if(s[i] == ')') { --depth; continue; }
-      if(depth == 0 && s.substr(i, conn.size()) == conn)
-        found = i;
-    }
-    return found;
-  };
-
-  // Split on a logical connective (outside parens) and recurse.
-  auto split_logical = [&](const std::string &s,
-                           const std::string &conn,
-                           irep_idt id) -> std::optional<exprt>
-  {
-    const auto pos = find_connective(s, conn);
-    if(pos == std::string::npos)
-      return std::nullopt;
-    auto lhs = parse_expr(s.substr(0, pos));
-    auto rhs = parse_expr(s.substr(pos + conn.size()));
-    if(!lhs || !rhs)
-      return std::nullopt;
-    return binary_exprt(*lhs, id, *rhs, bool_typet{});
-  };
-
-  parse_expr = [&](const std::string &s) -> std::optional<exprt>
-  {
-    std::string t = trim(s);
-    // Strip outer parentheses.
-    while(t.size() >= 2 && t.front() == '(' && t.back() == ')')
-    {
-      // Make sure the opening paren actually closes at the end.
-      int depth = 0;
-      bool matched = true;
-      for(std::size_t i = 0; i < t.size() - 1; ++i)
-      {
-        if(t[i] == '(') ++depth;
-        else if(t[i] == ')') { --depth; if(depth == 0) { matched = false; break; } }
-      }
-      if(!matched) break;
-      t = trim(t.substr(1, t.size() - 2));
-    }
-    // || has lowest precedence, then &&, then atoms.
-    if(auto r = split_logical(t, "||", ID_or))
-      return r;
-    if(auto r = split_logical(t, "&&", ID_and))
-      return r;
-    return parse_atom(t);
-  };
-
-  auto result = parse_expr(expr_str);
-  if(!result)
+  const namespacet ns(base_st);
+  ansi_c_languaget language;
+  exprt expr;
+  null_message_handlert null_message; // suppress "failed to find symbol" noise
+  if(language.to_expr(expr_str, "", expr, ns, null_message))
   {
     messaget log(message_handler);
     log.warning() << "parse_invariant_string: cannot parse \"" << expr_str
                   << "\"" << messaget::eom;
+    return std::nullopt;
   }
-  return result;
+
+  // Substitute base-name symbol_exprt nodes with the real ones.
+  std::function<void(exprt &)> substitute = [&](exprt &e) {
+    if(e.id() == ID_symbol)
+    {
+      auto it = base_to_real.find(to_symbol_expr(e).get_identifier());
+      if(it != base_to_real.end())
+        e = it->second;
+      return;
+    }
+    for(auto &op : e.operands())
+      substitute(op);
+  };
+  substitute(expr);
+
+  return expr;
 }
